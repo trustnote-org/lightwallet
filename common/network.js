@@ -259,7 +259,13 @@ function onWebsocketMessage(message) {
     }
     var message_type = arrMessage[0];
     var content = arrMessage[1];
-    
+    /*
+    轻钱包来说应该不需要来服务其他peer的请求, 即handlerRequest, 
+    它只需handleResponse,即自己发出去的请求, 收到的响应
+    headless 应该也是, 不必服务其他的peer
+
+    handleRequest 即仅仅为hub的方法, 
+    */
     switch (message_type){
         case 'justsaying':
             return handleJustsaying(ws, content.subject, content.body);
