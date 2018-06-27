@@ -497,11 +497,176 @@ function readFundedAddresses(asset, wallet, estimated_amount, handleFundedAddres
     );
 }
 
+function readTransactionHistory(opts, handleHistory){
+    var asset = opts.asset;
+    if (opts.wallet && opts.address || !opts.wallet && !opts.address)
+        throw Error('invalid wallet and address params');
+    var wallet = opts.wallet || opts.address;
+    var walletIsAddress = ValidationUtils.isValidAddress(wallet);
+    var join_my_addresses = walletIsAddress ? "" : "JOIN my_addresses USING(address)";
+    var where_condition = walletIsAddress ? "address=?" : "wallet=?";
+    var asset_condition = (asset && asset !== "base") ? "asset="+db.escape(asset) : "asset IS NULL";
+    var cross = "";
+    if (opts.unit)
+        where_condition += " AND unit="+db.escape(opts.unit);
+    else if (opts.since_mci && ValidationUtils.isNonnegativeInteger(opts.since_mci)){
+        where_condition += " AND main_chain_index>="+opts.since_mci;
+        cross = "CROSS";
+    }
+    db.query(
+        "SELECT unit, level, is_stable, sequence, address, \n\
+            "+db.getUnixTimestamp("units.creation_date")+" AS ts, headers_commission+payload_commission AS fee, \n\
+            SUM(amount) AS amount, address AS to_address, NULL AS from_address, main_chain_index AS mci \n\
+        FROM units "+cross+" JOIN outputs USING(unit) "+join_my_addresses+" \n\
+        WHERE "+where_condition+" AND "+asset_condition+" \n\
+        GROUP BY unit, address \n\
+        UNION \n\
+        SELECT unit, level, is_stable, sequence, address, \n\
+            "+db.getUnixTimestamp("units.creation_date")+" AS ts, headers_commission+payload_commission AS fee, \n\
+            NULL AS amount, NULL AS to_address, address AS from_address, main_chain_index AS mci \n\
+        FROM units "+cross+" JOIN inputs USING(unit) "+join_my_addresses+" \n\
+        WHERE "+where_condition+" AND "+asset_condition+" \n\
+        ORDER BY ts DESC"+(opts.limit ? " LIMIT ?" : ""),
+        opts.limit ? [wallet, wallet, opts.limit] : [wallet, wallet],
+        function(rows){
+            var assocMovements = {};
+            for (var i=0; i<rows.length; i++){
+                var row = rows[i];
+                //if (asset !== "base")
+                //    row.fee = null;
+                if (!assocMovements[row.unit])
+                    assocMovements[row.unit] = {
+                        plus:0, has_minus:false, ts: row.ts, level: row.level, is_stable: row.is_stable, sequence: row.sequence, fee: row.fee, mci: row.mci
+                    };
+                if (row.to_address){
+                    assocMovements[row.unit].plus += row.amount;
+                //  assocMovements[row.unit].my_address = row.to_address;
+                    if (!assocMovements[row.unit].arrMyRecipients)
+                        assocMovements[row.unit].arrMyRecipients = [];
+                    assocMovements[row.unit].arrMyRecipients.push({my_address: row.to_address, amount: row.amount})
+                }
+                if (row.from_address)
+                    assocMovements[row.unit].has_minus = true;
+            }
+        //  console.log(require('util').inspect(assocMovements));
+            var arrTransactions = [];
+            async.forEachOfSeries(
+                assocMovements,
+                function(movement, unit, cb){
+                    if (movement.sequence !== 'good'){
+                        var transaction = {
+                            action: 'invalid',
+                            confirmations: movement.is_stable,
+                            unit: unit,
+                            fee: movement.fee,
+                            time: movement.ts,
+                            level: movement.level,
+                            mci: movement.mci
+                        };
+                        arrTransactions.push(transaction);
+                        cb();
+                    }
+                    //绝大多数情况是 outputs表中的,
+                    else if (movement.plus && !movement.has_minus){
+                        // light clients will sometimes have input address = NULL
+                        db.query(
+                            "SELECT DISTINCT address FROM inputs WHERE unit=? AND "+asset_condition+" ORDER BY address", 
+                            [unit], 
+                            function(address_rows){
+                                var arrPayerAddresses = address_rows.map(function(address_row){ return address_row.address; });
+                                movement.arrMyRecipients.forEach(function(objRecipient){
+                                    var transaction = {
+                                        action: 'received',
+                                        amount: objRecipient.amount,
+                                        my_address: objRecipient.my_address,
+                                        arrPayerAddresses: arrPayerAddresses,
+                                        confirmations: movement.is_stable,
+                                        unit: unit,
+                                        fee: movement.fee,
+                                        time: movement.ts,
+                                        level: movement.level,
+                                        mci: movement.mci
+                                    };
+                                    arrTransactions.push(transaction);
+                                });
+                                cb();
+                            }
+                        );
+                    }
+                    //都是 inputs 表中的 item
+                    else if (movement.has_minus){
+                        var queryString, parameters;
+                        if(walletIsAddress){
+                            queryString =   "SELECT address, SUM(amount) AS amount, (address!=?) AS is_external \n\
+                                            FROM outputs \n\
+                                            WHERE unit=? AND "+asset_condition+" \n\
+                                            GROUP BY address";
+                            parameters = [wallet, unit];
+                        }
+                        else {
+                            queryString =   "SELECT outputs.address, SUM(amount) AS amount, (my_addresses.address IS NULL) AS is_external \n\
+                                            FROM outputs \n\
+                                            LEFT JOIN my_addresses ON outputs.address=my_addresses.address AND wallet=? \n\
+                                            WHERE unit=? AND "+asset_condition+" \n\
+                                            GROUP BY outputs.address";
+                            parameters = [wallet, unit];
+                        }
+                        db.query(queryString, parameters, 
+                            function(payee_rows){
+                            	//is_external 为 1,证明 my_addresses.address is null, 表明这个地址在outputs表中有, 但是my_addresses表中没有, 这时为 sent
+                            	//is_external 为 0,证明 outputs 和 my_addresses表中都有这个地址, 为 move,为自己一个钱包中的地址相互转账, 成为move,因为钱还在这个钱包中;
+                                var action = payee_rows.some(function(payee){ return payee.is_external; }) ? 'sent' : 'moved';
+                                for (var i=0; i<payee_rows.length; i++){
+                                    var payee = payee_rows[i];
+                                    if (action === 'sent' && !payee.is_external)
+                                        continue;
+                                    var transaction = {
+                                        action: action,
+                                        amount: payee.amount,
+                                        addressTo: payee.address,
+                                        confirmations: movement.is_stable,
+                                        unit: unit,
+                                        fee: movement.fee,
+                                        time: movement.ts,
+                                        level: movement.level,
+                                        mci: movement.mci
+                                    };
+                                    if (action === 'moved')
+                                        transaction.my_address = payee.address;
+                                    arrTransactions.push(transaction);
+                                }
+                                cb();
+                            }
+                        );
+                    }
+                },
+                function(){
+                    arrTransactions.sort(function(a, b){
+                        if (a.level < b.level)
+                            return 1;
+                        if (a.level > b.level)
+                            return -1;
+                        if (a.time < b.time)
+                            return 1;
+                        if (a.time > b.time)
+                            return -1;
+                        return 0;
+                    });
+                    arrTransactions.forEach(function(transaction){ transaction.asset = asset; });
+                    handleHistory(arrTransactions);
+                }
+            );
+        }
+    );
+}
+
 
 
 exports.readBalance = readBalance;
 exports.sendPaymentFromWallet = sendPaymentFromWallet;
 exports.sendMultiPayment = sendMultiPayment;
+exports.readTransactionHistory = readTransactionHistory;
+
 
 /*
 walletGeneral.readMyAddresses(function(arrAddresses){
@@ -514,7 +679,6 @@ walletGeneral.readMyAddresses(function(arrAddresses){
 exports.sendSignature = sendSignature;
 exports.readSharedBalance = readSharedBalance;
 exports.readBalancesOnAddresses = readBalancesOnAddresses;
-exports.readTransactionHistory = readTransactionHistory;
 exports.readDeviceAddressesUsedInSigningPaths = readDeviceAddressesUsedInSigningPaths;
 exports.determineIfDeviceCanBeRemoved = determineIfDeviceCanBeRemoved;
 */

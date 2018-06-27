@@ -14,13 +14,13 @@ async function test () {
     body.id = "1";
 
     // body.method = 'getaddressbalance';
-    body.params = ['AC32OSLNT64L2B2GARP7SNFDPR3WDNZZ'];
-    
+    // body.params = ['AC32OSLNT64L2B2GARP7SNFDPR3WDNZZ'];
+    body.params = [];
     // body.method =  'getbalance';
     // body.method =  'getalladdress';
     // body.method = 'getnewaddress';
     // body.method = 'listtransactions';
-    body.method = 'getaddressinfo';
+    body.method = 'listtransactions';
     
     opt.body = JSON.stringify(body);
     let ret  = await request(opt);
